@@ -79,6 +79,7 @@ with warnings.catch_warnings():
 import torch
 from torch import onnx
 import torch.nn as nn
+from torch._ops import ops
 from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
@@ -189,7 +190,7 @@ class DLRM_Net(nn.Module):
 
     def create_emb(self, m, ln):
         emb_l = nn.ModuleList()
-        # save the numpy random state
+                # save the numpy random state
         np_rand_state = np.random.get_state()
         for i in range(0, ln.size):
             if ext_dist.my_size > 1:
@@ -309,7 +310,12 @@ class DLRM_Net(nn.Module):
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
             if (proj_size > 0):
-                self.proj_l = project.create_proj(len(ln_emb)+1, proj_size)
+                self.proj_l = project.create_proj(len(ln_emb)+1, proj_size)            
+
+            # quantization
+            self.quantize_emb = False
+            self.emb_l_q = []
+            self.quantize_bits = 32            
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -343,14 +349,61 @@ class DLRM_Net(nn.Module):
             # We are using EmbeddingBag, which implicitly uses sum operator.
             # The embeddings are represented as tall matrices, with sum
             # happening vertically across 0 axis, resulting in a row vector
-            E = emb_l[k]
-            V = E(sparse_index_group_batch, sparse_offset_group_batch)
+            per_sample_weights = None
 
-            ly.append(V)
+            if self.quantize_emb:
+                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                print("quantized emb sizes:", s1, s2)
+
+                if self.quantize_bits == 4:
+                    QV = ops.quantized.embedding_bag_4bit_rowwise_offsets(
+                        self.emb_l_q[k],
+                        sparse_index_group_batch,
+                        sparse_offset_group_batch,
+                        per_sample_weights=per_sample_weights,
+                    )
+                elif self.quantize_bits == 8:
+                    QV = ops.quantized.embedding_bag_byte_rowwise_offsets(
+                        self.emb_l_q[k],
+                        sparse_index_group_batch,
+                        sparse_offset_group_batch,
+                        per_sample_weights=per_sample_weights,
+                    )
+
+                ly.append(QV)
+            else:
+                E = emb_l[k]
+                V = E(
+                    sparse_index_group_batch,
+                    sparse_offset_group_batch,
+                    per_sample_weights=per_sample_weights,
+                )
+
+                ly.append(V)            
 
         # print(ly)
         return ly
 
+    #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
+    def quantize_embedding(self, bits):
+
+        n = len(self.emb_l)
+        self.emb_l_q = [None] * n
+        for k in range(n):
+            if bits == 4:
+                self.emb_l_q[k] = ops.quantized.embedding_bag_4bit_prepack(
+                    self.emb_l[k].weight
+                )
+            elif bits == 8:
+                self.emb_l_q[k] = ops.quantized.embedding_bag_byte_prepack(
+                    self.emb_l[k].weight
+                )
+            else:
+                return
+        self.emb_l = None
+        self.quantize_emb = True
+        self.quantize_bits = bits
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
@@ -366,7 +419,7 @@ class DLRM_Net(nn.Module):
                 #Z  = torch.bmm(T, TR)
                 #Zflat = Z.view((batch_size, -1))
                 #R = torch.cat([x] + [Zflat], dim=1)
-            else:
+            else:            
                 Z = torch.bmm(T, torch.transpose(T, 1, 2))
                 # append dense feature with the interactions (into a row vector)
                 # approach 1: all
@@ -429,7 +482,7 @@ class DLRM_Net(nn.Module):
             z = p
 
         return z
-
+    
     def distributed_forward(self, dense_x, lS_o, lS_i):
         batch_size = dense_x.size()[0]
         # WARNING: # of ranks must be <= batch size in distributed_forward call
@@ -665,8 +718,7 @@ if __name__ == "__main__":
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
-    parser.add_argument(
-        "--loss-weights", type=dash_separated_floats, default="1.0-1.0")  # for wbce
+    parser.add_argument("--loss-weights", type=str, default="1.0-1.0")  # for wbce
     parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
     parser.add_argument("--round-targets", type=bool, default=False)
     # data
@@ -705,6 +757,9 @@ if __name__ == "__main__":
     parser.add_argument("--sync-dense-params", type=bool, default=True)
     # inference
     parser.add_argument("--inference-only", action="store_true", default=False)
+    # quantize
+    parser.add_argument("--quantize-mlp-with-bit", type=int, default=32)
+    parser.add_argument("--quantize-emb-with-bit", type=int, default=32)
     # onnx
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
@@ -751,6 +806,15 @@ if __name__ == "__main__":
     if args.mlperf_logging:
         print('command line args: ', json.dumps(vars(args)))
 
+    if args.quantize_emb_with_bit in [4, 8]:
+        if args.qr_flag:
+            sys.exit(
+                "ERROR: 4 and 8-bit quantization with quotient remainder is not supported"
+            )
+        if args.md_flag:
+            sys.exit(
+                "ERROR: 4 and 8-bit quantization with mixed dimensions is not supported"
+            )
     ### some basic setup ###
     np.random.seed(args.numpy_rand_seed)
     np.set_printoptions(precision=args.print_precision)
@@ -813,8 +877,8 @@ if __name__ == "__main__":
         m_den = ln_bot[0]
         train_data, train_ld = dd.data_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-        table_feature_map = None #  {idx : idx for idx in range(len(ln_emb))}
-
+        table_feature_map = None #  {idx : idx for idx in range(len(ln_emb))}  
+              
     else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
@@ -832,7 +896,7 @@ if __name__ == "__main__":
         # approach 2: unique
         if (args.arch_project_size > 0):
             num_int = num_fea * args.arch_project_size + m_den_out
-        else:
+        else:        
             if args.arch_interaction_itself:
                 num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
             else:
@@ -989,7 +1053,7 @@ if __name__ == "__main__":
         dlrm = dlrm.to(device)  # .cuda()
         if dlrm.ndevices > 1:
             dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb)
-
+            
     if ext_dist.my_size > 1:
         if use_gpu:
             device_ids = [ext_dist.my_local_rank]
@@ -1023,7 +1087,7 @@ if __name__ == "__main__":
                 {"params": dlrm.bot_l.parameters(), "lr" : args.learning_rate * ext_dist.my_size},
                 {"params": dlrm.top_l.parameters(), "lr" : args.learning_rate * ext_dist.my_size}
             ], lr=args.learning_rate)
-
+            
     ### main loop ###
     def time_wrap(use_gpu):
         if use_gpu:
@@ -1139,10 +1203,37 @@ if __name__ == "__main__":
     ext_dist.barrier()
     startTime = time.time()
     startTime0 = startTime
-    skipped = 0
+    skipped = 0        
+
+    if args.inference_only:
+        # Currently only dynamic quantization with INT8 and FP16 weights are
+        # supported for MLPs and INT4 and INT8 weights for EmbeddingBag
+        # post-training quantization during the inference.
+        # By default we don't do the quantization: quantize_{mlp,emb}_with_bit == 32 (FP32)
+        assert args.quantize_mlp_with_bit in [
+            8,
+            16,
+            32,
+        ], "only support 8/16/32-bit but got {}".format(args.quantize_mlp_with_bit)
+        assert args.quantize_emb_with_bit in [
+            4,
+            8,
+            32,
+        ], "only support 4/8/32-bit but got {}".format(args.quantize_emb_with_bit)
+        if args.quantize_mlp_with_bit != 32:
+            if args.quantize_mlp_with_bit in [8]:
+                quantize_dtype = torch.qint8
+            else:
+                quantize_dtype = torch.float16
+            dlrm = torch.quantization.quantize_dynamic(
+                dlrm, {torch.nn.Linear}, quantize_dtype
+            )
+        if args.quantize_emb_with_bit != 32:
+            dlrm.quantize_embedding(args.quantize_emb_with_bit)
+            # print(dlrm)
 
     print("time/loss/accuracy (if enabled):")
-    with torch.autograd.profiler.profile(args.enable_profiling, use_gpu, record_shapes=True) as prof:
+    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, record_shapes=True) as prof:
         while k < args.nepochs:
             if k < skip_upto_epoch:
                 continue
@@ -1163,7 +1254,7 @@ if __name__ == "__main__":
                     ext_dist.barrier()
                     startTime = time.time()
                     ext_dist.orig_print("ORIG TIME: ", startTime, accum_time_begin, startTime - accum_time_begin, " for process ", ext_dist.my_rank)
-                skipped = skipped + 1
+                skipped = skipped + 1                
 
                 if args.mlperf_logging:
                     current_time = time_wrap(use_gpu)
@@ -1190,7 +1281,7 @@ if __name__ == "__main__":
                 # Skip the batch if batch size not multiple of total ranks
                 if ext_dist.my_size > 1 and X.size(0) % ext_dist.my_size != 0:
                     print("Warning: Skiping the batch %d with size %d" % (j, X.size(0)))
-                    continue
+                    continue                
 
 
                 # forward pass
