@@ -193,7 +193,6 @@ class DLRM_Net(nn.Module):
                 # save the numpy random state
         np_rand_state = np.random.get_state()
         for i in range(0, ln.size):
-            print(i)
             if ext_dist.my_size > 1:
                 if not i in self.local_emb_indices: continue
             # Use per table random seed for Embedding initialization
