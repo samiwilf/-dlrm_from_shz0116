@@ -43,17 +43,21 @@ if __name__ == "__main__":
                 
 
             if True:
-                print (cmd) 
-                #continue
+                print (cmd.split()[0],cmd.split()[1])
+                for arg in cmd.split()[2:]:
+                    print(arg)
+                print("\n")
                 stderr = None
                 process = subprocess.run(cmd.split(), capture_output=True, stderr=stderr)
                 stdout_as_str = process.stdout.decode("utf-8")
                 print(stdout_as_str)
-                if stdout_as_str == 'LAP09755TN\nUsing CPU...\n':
-                    print("FAILED!")
-                else:
-                    print("SUCCESS!")                               
-                print("RETURN CODE: ", process.returncode)                
+                print("\n")
+                if False:
+                    if stdout_as_str == 'LAP09755TN\nUsing CPU...\n':
+                        print("FAILED!")
+                    else:
+                        print("SUCCESS!")                               
+                    print("RETURN CODE: ", process.returncode)                
             else:
                 #debugging purposes
                 for i in range (2,len(cmd)+1):
