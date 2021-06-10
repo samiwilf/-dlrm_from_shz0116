@@ -355,7 +355,7 @@ class DLRM_Net(nn.Module):
             if self.quantize_emb:
                 s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
                 s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                print("quantized emb sizes:", s1, s2)
+                #print("quantized emb sizes:", s1, s2)
 
                 if self.quantize_bits == 4:
                     QV = ops.quantized.embedding_bag_4bit_rowwise_offsets(
