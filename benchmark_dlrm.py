@@ -51,7 +51,7 @@ if __name__ == "__main__":
                 process = subprocess.run(cmd.split(), capture_output=True, stderr=stderr)
                 stdout_as_str = process.stdout.decode("utf-8")
                 print(stdout_as_str)
-                print("\n")
+                print("")
                 if False:
                     if stdout_as_str == 'LAP09755TN\nUsing CPU...\n':
                         print("FAILED!")
