@@ -282,14 +282,14 @@ class DLRM_Net(nn.Module):
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
             # create variables for QR embedding if applicable
-            self.qr_flag = qr_flag
+            self.qr_flag = qr_flag          ### qt = quotient-remainder
             if self.qr_flag:
                 self.qr_collisions = qr_collisions
                 self.qr_operation = qr_operation
                 self.qr_threshold = qr_threshold
             # create variables for MD embedding if applicable
             self.md_flag = md_flag
-            if self.md_flag:
+            if self.md_flag:                ### md = mixed dimensions
                 self.md_threshold = md_threshold
 
             # generate np seeds for Emb table initialization
@@ -687,6 +687,8 @@ if __name__ == "__main__":
     import os
     import argparse
 
+    raise ValueError('exception was raised by Sami')
+
     ### parse arguments ###
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
@@ -1052,7 +1054,7 @@ if __name__ == "__main__":
         # the embeddings are distributed and use model parallelism
         dlrm = dlrm.to(device)  # .cuda()
         if dlrm.ndevices > 1:
-            dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb)
+            dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb) ###############################################################################################
             
     if ext_dist.my_size > 1:
         if use_gpu:
@@ -1229,7 +1231,7 @@ if __name__ == "__main__":
                 dlrm, {torch.nn.Linear}, quantize_dtype
             )
         if args.quantize_emb_with_bit != 32:
-            dlrm.quantize_embedding(args.quantize_emb_with_bit)
+            dlrm.quantize_embedding(args.quantize_emb_with_bit) ###############################################################################################
             # print(dlrm)
 
     print("time/loss/accuracy (if enabled):")
