@@ -51,6 +51,19 @@
 # Misha Smelyanskiy, "Deep Learning Recommendation Model for Personalization and
 # Recommendation Systems", CoRR, arXiv:1906.00091, 2019
 
+#TERMS:
+#
+# ln_
+# qr_       quotient-remainder trick
+# md_       mixed-dimension trick
+# lS_       layer sparse?
+# ls_i      Indices. list (type tensor) of np.argmax-type values representing which rows to select.   
+#           Example and explanation: list_of_embedding_vectors[ ls_i[0] ] is how 
+#           ls_i[foo] is used as a key-value lookup to retrieve an embedding vec.
+# ls_o      Offsets. list (type tensor) of offsets that determine which selected embeddings are grouped
+#           together for the 'mode' operation. (Mode operation examples: sum, mean, max)
+
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # miscellaneous
@@ -190,14 +203,14 @@ class DLRM_Net(nn.Module):
 
     def create_emb(self, m, ln):
         emb_l = nn.ModuleList()
-                # save the numpy random state
+            # save the numpy random state
         np_rand_state = np.random.get_state()
         for i in range(0, ln.size):
             if ext_dist.my_size > 1:
                 if not i in self.local_emb_indices: continue
             # Use per table random seed for Embedding initialization
             np.random.seed(self.l_emb_seeds[i])
-            n = ln[i]
+            n = ln[i]   # n stores the # of rows (i.e., embedding vectors) in table ln[i]
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
                 EE = QREmbeddingBag(n, m, self.qr_collisions,
@@ -687,8 +700,6 @@ if __name__ == "__main__":
     import os
     import argparse
 
-    raise ValueError('exception was raised by Sami')
-
     ### parse arguments ###
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
@@ -795,6 +806,14 @@ if __name__ == "__main__":
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
 
+
+    #no_concat
+    #concat_temp
+    #concat_onward
+    #are the emb tables concatenated, or the sparse feature vectors inputted to the tables?
+    parser.add_argument("--concat_emb_tables", type=str, default="no_concat")
+
+
     args = parser.parse_args()
 
     print(socket.gethostname())
@@ -887,6 +906,12 @@ if __name__ == "__main__":
         m_den = ln_bot[0]
         train_data, train_ld = dd.make_random_data_and_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+
+
+        #check that all lS_o are the same shape.
+        #for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+        #    print("lS_o.shape",lS_o.shape)
+
 
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
