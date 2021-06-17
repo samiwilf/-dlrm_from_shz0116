@@ -687,8 +687,6 @@ if __name__ == "__main__":
     import os
     import argparse
 
-    raise ValueError('exception was raised by Sami')
-
     ### parse arguments ###
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
