@@ -1,26 +1,37 @@
 import subprocess
 if __name__ == "__main__":
-    #Global Batchsize
+    
+    # Global Batchsize
     MB = [[64,256,1024]]*4
-    #Average number of indices for look-up per table
+
+    # Average number of indices for look-up per table
     P = [8,16,16,18]
-    #Total number of tables for inference
+
+    # Total number of tables for inference
     S = [308,363,429,527]
-    #Dimension of the vector for each row of the table, embedding dimension
+
+    # Dimension of the vector for each row of the table, embedding dimension
     E = [94,127,173,256]
-    #Shrink Average number of rows per table to fit in 1 card (use this)
+
+    # Shrink Average number of rows per table to fit in 1 card (use this)
     M = [555693, 347308, 213728, 118233]
-    #Length of inputs to bottom MLP
+
+    # Length of inputs to bottom MLP
     D = [1414, 1485, 1559, 1715] 
-    #Number of bottom MLP layers
+
+    # Number of bottom MLP layers
     Nb = [8,8,8,10]
-    #Bottom MLP size
+
+    # Bottom MLP size
     Lb = [1750,2100,2500,2750]
-    #Number of top MLP layers
+
+    # Number of top MLP layers
     Nt = [36,36,40,45]
-    #Top MLP size
+
+    # Top MLP size
     Lt = [1450,1700,2000,2200]
-    #Number of vectors resulting from interaction
+
+    # Number of vectors resulting from interaction
     I = [8,10,12,14]
     
     use_string_format = False

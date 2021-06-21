@@ -121,6 +121,53 @@ import dlrm_data as dd
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+if False:
+    from fbgemm_gpu.split_table_batched_embeddings_ops import (
+        CacheAlgorithm,
+        ComputeDevice,
+        EmbeddingLocation,
+        OptimType,
+        SparseType,
+        SplitTableBatchedEmbeddingBagsCodegen,
+        Int4TableBatchedEmbeddingBagsCodegen,
+    )
+
+    def infer_gpu(
+        model, device, batch_size, num_embedding_rows, embed_dim, 
+        pooling_factor, num_tables, indices, offsets, lengths, args
+        ):
+        if args.quantize_emb is False:
+            # assume fp16
+            model = model.half()
+        elif args.quantize_bits == 4:
+            model = Int4TableBatchedEmbeddingBagsCodegen(
+                    [(num_embedding_rows, embed_dim) for _ in range(num_tables)],).cuda()
+            all_indices = torch.stack(indices, dim=0)
+            indices = all_indices.long().contiguous().view(-1).int().cuda()
+            print(indices)
+            all_lengths = torch.stack(lengths, dim=0).flatten()
+            offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).int().cuda()
+        elif args.quantize_bits == 8:
+            model = SplitTableBatchedEmbeddingBagsCodegen(
+            [(num_embedding_rows, embed_dim, EmbeddingLocation.DEVICE, ComputeDevice.CUDA)
+                for _ in range(num_tables)],weights_precision = SparseType.INT8).cuda()
+            all_indices = torch.stack(indices, dim=0)
+            indices = all_indices.long().contiguous().view(-1).cuda()
+            all_lengths = torch.stack(lengths, dim=0).flatten()
+            offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).long().cuda()
+    
+
+        for i in range(args.warmups):
+            output = model(indices, offsets)
+        torch.cuda.synchronize()
+        start = time.time()
+        for i in range(args.steps):
+            output = model(indices, offsets)
+        torch.cuda.synchronize()
+        end = time.time()
+
+        return (end - start)
+
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 class LRPolicyScheduler(_LRScheduler):
@@ -201,7 +248,31 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
-    def create_emb(self, m, ln):
+    def create_emb(self, m, ln):   
+        # to do: use docstring. Perhaps https://sphinx-rtd-tutorial.readthedocs.io/en/latest/docstrings.html ??
+        # create_emb explained in plain english:
+        #
+        # ln parameter:
+        # ln is a list of all the tables' row counts. E.g. [10,5,16] would mean table 0 has 10 rows, 
+        # table 1 has 5 rows, and table 2 has 16 rows.
+        # 
+        # m parameter (when m is a single value):
+        # m is the length of all embedding vectors. All embedding vectors in all embedding tables are 
+        # created to be the same length. E.g. if ln were [3,2,5] and m were 4, table 0 would be dimension
+        # 3 x 4, table 1 would be 2 x 4, and table 2 would be 5 x 4.
+        # 
+        # m parameter (when m is a list):
+        # m is a list of all the tables' column counts. E.g. if m were [4,5,6] and ln were [3,2,5],
+        # table 0 would be dimension 3 x 4, table 1 would be 2 x 5, and table 2 would be 5 x 6.
+        # 
+        # Key to remember:
+        # embedding table i has shape: ln[i] rows, m columns, when m is a single value.
+        # embedding table i has shape: ln[i] rows, m[i] columns, when m is a list.
+        
+
+
+
+
         emb_l = nn.ModuleList()
             # save the numpy random state
         np_rand_state = np.random.get_state()
@@ -217,7 +288,7 @@ class DLRM_Net(nn.Module):
                     operation=self.qr_operation, mode="sum", sparse=True)
             elif self.md_flag:
                 base = max(m)
-                _m = m[i] if n > self.md_threshold else base
+                _m = m[i] if n > self.md_threshold else base   # I see m[i] here.. Is m[i] a list or a single value??
                 EE = PrEmbeddingBag(n, _m, base)
                 # use np initialization as below for consistency...
                 W = np.random.uniform(
@@ -318,8 +389,12 @@ class DLRM_Net(nn.Module):
                 #ln_emb = ln_emb[self.local_emb_slice]
 
             # create operators
-            if ndevices <= 1:
-                self.emb_l = self.create_emb(m_spa, ln_emb)
+            use_gpu = True
+            if not use_gpu:
+                if ndevices <= 1:
+                    self.emb_l = self.create_emb(m_spa, ln_emb)  #self.emb_l stores list of nn.EmbeddingBag instantiations. There are ln_emb.size() instantiations. Each instantion's dimension is m_spa columns by ln_emb[i] rows.
+
+
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
             if (proj_size > 0):
@@ -1256,8 +1331,17 @@ if __name__ == "__main__":
                 dlrm, {torch.nn.Linear}, quantize_dtype
             )
         if args.quantize_emb_with_bit != 32:
-            dlrm.quantize_embedding(args.quantize_emb_with_bit) ###############################################################################################
+            dlrm.quantize_embedding(args.quantize_emb_with_bit)
             # print(dlrm)
+
+
+    #####################################################################################################################################
+    #####################################################################################################################################
+    #####################################################################################################################################
+    #####################################################################################################################################
+    #####################################################################################################################################
+    #CONVERT TO NEW FORMAT HERE!#########################################################################################################
+
 
     print("time/loss/accuracy (if enabled):")
     with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, record_shapes=True) as prof:
@@ -1269,6 +1353,8 @@ if __name__ == "__main__":
 
             if args.mlperf_logging:
                 previous_iteration_time = None
+
+            #regarding enumerate(train_ld which is a dataloader)  https://pytorch.org/docs/stable/data.html
 
             for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
                 if j == 0 and args.save_onnx:
@@ -1419,6 +1505,20 @@ if __name__ == "__main__":
                         Z_test = dlrm_wrap(
                             X_test, lS_o_test, lS_i_test, use_gpu, device
                         )
+
+                        
+                        
+                        
+                        #########################################################################################################
+                        #########################################################################################################
+                        #########################################################################################################
+                        #########################################################################################################
+                        #########################################################################################################
+                        # CONVERT GPU-OPTIMIZED FORMAT BACK TO REGULAR FORMAT HERE ##############################################
+
+
+
+
                         if args.mlperf_logging:
                             S_test = Z_test.detach().cpu().numpy()  # numpy array
                             T_test = T_test.detach().cpu().numpy()  # numpy array
