@@ -121,7 +121,9 @@ import dlrm_data as dd
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+#setting this off because I place this file in fbgemm_gpu's directory as a temporary workaround to acces fbgemm_gpu calls.
 if False:
+    #To build fbgemm_gpu, commit id 0fe80ee014b936733278a77d0a24c9fe9a431c31 was used.
     from fbgemm_gpu.split_table_batched_embeddings_ops import (
         CacheAlgorithm,
         ComputeDevice,
@@ -130,43 +132,68 @@ if False:
         SparseType,
         SplitTableBatchedEmbeddingBagsCodegen,
         Int4TableBatchedEmbeddingBagsCodegen,
-    )
+)
 
-    def infer_gpu(
-        model, device, batch_size, num_embedding_rows, embed_dim, 
-        pooling_factor, num_tables, indices, offsets, lengths, args
-        ):
-        if args.quantize_emb is False:
-            # assume fp16
-            model = model.half()
-        elif args.quantize_bits == 4:
-            model = Int4TableBatchedEmbeddingBagsCodegen(
-                    [(num_embedding_rows, embed_dim) for _ in range(num_tables)],).cuda()
-            all_indices = torch.stack(indices, dim=0)
-            indices = all_indices.long().contiguous().view(-1).int().cuda()
-            print(indices)
-            all_lengths = torch.stack(lengths, dim=0).flatten()
-            offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).int().cuda()
-        elif args.quantize_bits == 8:
-            model = SplitTableBatchedEmbeddingBagsCodegen(
-            [(num_embedding_rows, embed_dim, EmbeddingLocation.DEVICE, ComputeDevice.CUDA)
-                for _ in range(num_tables)],weights_precision = SparseType.INT8).cuda()
-            all_indices = torch.stack(indices, dim=0)
-            indices = all_indices.long().contiguous().view(-1).cuda()
-            all_lengths = torch.stack(lengths, dim=0).flatten()
-            offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).long().cuda()
-    
+def infer_gpu(
+    model, device, list_of_embedding_tables_tensors, num_embedding_rows, embed_dim, 
+    num_tables, indices, offsets, lengths, quantize_emb, quantize_bits
+    ):
 
-        for i in range(args.warmups):
-            output = model(indices, offsets)
-        torch.cuda.synchronize()
-        start = time.time()
-        for i in range(args.steps):
-            output = model(indices, offsets)
-        torch.cuda.synchronize()
-        end = time.time()
+    #if quantize_emb is False:
+    #    # assume fp16
+    #    model = model.half()
+    if quantize_bits == 4:
+        model = Int4TableBatchedEmbeddingBagsCodegen(
+                [(num_embedding_rows, embed_dim) for _ in range(num_tables)],
+                list_of_embedding_tables_tensors
+                ).cuda()
+        all_indices = torch.stack(indices, dim=0)
+        indices = all_indices.long().contiguous().view(-1).int().cuda()
+        print(indices)
+        all_lengths = torch.stack(lengths, dim=0).flatten()
+        offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).int().cuda()
 
-        return (end - start)
+    elif quantize_bits == 8:
+        model = SplitTableBatchedEmbeddingBagsCodegen(
+        [(num_embedding_rows, embed_dim, EmbeddingLocation.DEVICE, ComputeDevice.CUDA)
+            for _ in range(num_tables)],weights_precision = SparseType.INT8).cuda()
+        
+        all_indices = torch.stack(indices, dim=0)
+        indices = all_indices.long().contiguous().view(-1).cuda()
+        all_lengths = torch.stack(lengths, dim=0).flatten()
+        offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).long().cuda()
+    else:
+
+        concatenated_embedding_tables = torch.zeros( num_tables * num_embedding_rows, embed_dim ).cuda()
+        prefix_sum_offsets = [0]
+        prefix_sum_indices = [0]
+        for i in range(num_tables):
+            concatenated_embedding_tables[i*num_embedding_rows:(i+1)*num_embedding_rows,:] = torch.clone(list_of_embedding_tables_tensors[i])
+            offsets[i] += prefix_sum_indices[i]
+            indices[i] += i*num_embedding_rows
+            prefix_sum_offsets.append(prefix_sum_offsets[-1] + len(offsets[i]))
+            prefix_sum_indices.append(prefix_sum_indices[-1] + indices[i].shape[0])
+        offsets = offsets.flatten()
+        indices = torch.cat(indices, dim=0).cuda()
+        model = torch.nn.EmbeddingBag.from_pretrained(concatenated_embedding_tables, mode = 'sum').to(device)
+        #torch.cuda.synchronize()
+
+    output = model(indices, offsets)
+
+    result = [ output[prefix_sum_offsets[i]:prefix_sum_offsets[i+1], :] for i in range (num_tables) ]
+
+    return result
+
+    for i in range(args.warmups):
+        output = model(indices, offsets)
+    torch.cuda.synchronize()
+    start = time.time()
+    for i in range(args.steps):
+        output = model(indices, offsets)
+    torch.cuda.synchronize()
+    end = time.time()
+
+    return (end - start)
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -389,11 +416,8 @@ class DLRM_Net(nn.Module):
                 #ln_emb = ln_emb[self.local_emb_slice]
 
             # create operators
-            use_gpu = True
-            if not use_gpu:
-                if ndevices <= 1:
-                    self.emb_l = self.create_emb(m_spa, ln_emb)  #self.emb_l stores list of nn.EmbeddingBag instantiations. There are ln_emb.size() instantiations. Each instantion's dimension is m_spa columns by ln_emb[i] rows.
-
+            if ndevices <= 1:
+                self.emb_l = self.create_emb(m_spa, ln_emb)  #self.emb_l stores list of nn.EmbeddingBag instantiations. There are ln_emb.size() instantiations. Each instantion's dimension is m_spa columns by ln_emb[i] rows.
 
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
@@ -430,47 +454,63 @@ class DLRM_Net(nn.Module):
         # 3. for a list of embedding tables there is a list of batched lookups
 
         ly = []
-        for k, sparse_index_group_batch in enumerate(lS_i):
-            sparse_offset_group_batch = lS_o[k]
 
-            # embedding lookup
-            # We are using EmbeddingBag, which implicitly uses sum operator.
-            # The embeddings are represented as tall matrices, with sum
-            # happening vertically across 0 axis, resulting in a row vector
-            per_sample_weights = None
+        process_all_tables_as_a_single_tensor = True
+        if process_all_tables_as_a_single_tensor:
 
-            if self.quantize_emb:
-                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                #print("quantized emb sizes:", s1, s2)
-
-                if self.quantize_bits == 4:
-                    QV = ops.quantized.embedding_bag_4bit_rowwise_offsets(
-                        self.emb_l_q[k],
-                        sparse_index_group_batch,
-                        sparse_offset_group_batch,
-                        per_sample_weights=per_sample_weights,
-                    )
-                elif self.quantize_bits == 8:
-                    QV = ops.quantized.embedding_bag_byte_rowwise_offsets(
-                        self.emb_l_q[k],
-                        sparse_index_group_batch,
-                        sparse_offset_group_batch,
-                        per_sample_weights=per_sample_weights,
-                    )
-
-                ly.append(QV)
-            else:
-                E = emb_l[k]
-                V = E(
-                    sparse_index_group_batch,
-                    sparse_offset_group_batch,
-                    per_sample_weights=per_sample_weights,
+            ly = infer_gpu(
+                model = self, 
+                device = next(self.parameters()).device, 
+                list_of_embedding_tables_tensors = [emb_l[i].weight for i in range(len(emb_l))],
+                num_embedding_rows = emb_l[0].weight.shape[0], 
+                embed_dim = emb_l[0].weight.shape[1], 
+                num_tables = len(emb_l), 
+                indices = lS_i,  #list of 1d tensors
+                offsets = lS_o,  #2d tensor
+                lengths = [x.shape[0] for x in lS_i], 
+                quantize_emb = self.quantize_emb, 
+                quantize_bits = self.quantize_bits #hard coded to 32 bit, from code forked from.
                 )
+        else:
+            for k, sparse_index_group_batch in enumerate(lS_i):
+                sparse_offset_group_batch = lS_o[k]
 
-                ly.append(V)            
+                # embedding lookup
+                # We are using EmbeddingBag, which implicitly uses sum operator.
+                # The embeddings are represented as tall matrices, with sum
+                # happening vertically across 0 axis, resulting in a row vector
+                per_sample_weights = None
 
-        # print(ly)
+                if self.quantize_emb:
+                    s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                    s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                    #print("quantized emb sizes:", s1, s2)
+
+                    if self.quantize_bits == 4:
+                        QV = ops.quantized.embedding_bag_4bit_rowwise_offsets(
+                            self.emb_l_q[k],
+                            sparse_index_group_batch,
+                            sparse_offset_group_batch,
+                            per_sample_weights=per_sample_weights,
+                        )
+                    elif self.quantize_bits == 8:
+                        QV = ops.quantized.embedding_bag_byte_rowwise_offsets(
+                            self.emb_l_q[k],
+                            sparse_index_group_batch,
+                            sparse_offset_group_batch,
+                            per_sample_weights=per_sample_weights,
+                        )
+
+                    ly.append(QV)
+                else:
+                    E = emb_l[k]
+                    V = E(
+                        sparse_index_group_batch,
+                        sparse_offset_group_batch,
+                        per_sample_weights=per_sample_weights,
+                    )
+
+                    ly.append(V)
         return ly
 
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
@@ -1117,6 +1157,8 @@ if __name__ == "__main__":
 
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
+    torch.no_grad()
+
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
     # the weights we need to start from the same random seed.
@@ -1341,6 +1383,9 @@ if __name__ == "__main__":
     #####################################################################################################################################
     #####################################################################################################################################
     #CONVERT TO NEW FORMAT HERE!#########################################################################################################
+
+    #currently, the embedding tables are concatenated inside the inference loop, which slows it down. Move it to here.
+
 
 
     print("time/loss/accuracy (if enabled):")
