@@ -74,6 +74,9 @@ import functools
 import time
 import json
 # data generation
+
+import torch
+
 import dlrm_data_pytorch as dp
 
 # numpy
@@ -122,7 +125,7 @@ import dlrm_data as dd
 from torch.optim.lr_scheduler import _LRScheduler
 
 #setting this off because I place this file in fbgemm_gpu's directory as a temporary workaround to acces fbgemm_gpu calls.
-if False:
+if True:
     #To build fbgemm_gpu, commit id 0fe80ee014b936733278a77d0a24c9fe9a431c31 was used.
     from fbgemm_gpu.split_table_batched_embeddings_ops import (
         CacheAlgorithm,
@@ -142,45 +145,119 @@ def infer_gpu(
     #if quantize_emb is False:
     #    # assume fp16
     #    model = model.half()
+
+    offsets_original = offsets.detach().clone() #tensor
+    indices_original = [e.detach().clone() for e in indices] #list
+
+    prefix_sum_offsets = [0]
+    prefix_sum_indices = [0]
+    for i in range(num_tables):
+        offsets[i] += prefix_sum_indices[i]
+        indices[i] += i*num_embedding_rows
+        prefix_sum_offsets.append(prefix_sum_offsets[-1] + len(offsets[i]))
+        prefix_sum_indices.append(prefix_sum_indices[-1] + indices[i].shape[0])
+    offsets = offsets.flatten().contiguous().view(-1).cuda()
+
+    indices = torch.cat(indices, dim=0).cuda()
+    indices = indices.long().contiguous().view(-1).cuda()
+    
+    ss = torch.tensor([indices.numel()]).cuda()
+    offsets = torch.cat((offsets, ss))
+
     if quantize_bits == 4:
+        for i in range(3):
+            print("QUANTIZING 4!")
         model = Int4TableBatchedEmbeddingBagsCodegen(
                 [(num_embedding_rows, embed_dim) for _ in range(num_tables)],
+                #,
                 list_of_embedding_tables_tensors
                 ).cuda()
-        all_indices = torch.stack(indices, dim=0)
-        indices = all_indices.long().contiguous().view(-1).int().cuda()
-        print(indices)
-        all_lengths = torch.stack(lengths, dim=0).flatten()
-        offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).int().cuda()
+        #splits = model.splits()
+
+
+
+
+        result = model.forward(
+            indices.int(),
+            offsets.int(),
+        )
+        #all_indices = torch.stack(indices, dim=0)
+        #indices = all_indices.long().contiguous().view(-1).int().cuda()
+        #print(indices)
+        #all_lengths = torch.stack(lengths, dim=0).flatten()
+        #offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).int().cuda()
 
     elif quantize_bits == 8:
+        #for i in range(3):
+        #    print("QUANTIZING 8!")        
+        ###########################################################################################################
+        ###########################################################################################################
+        ###########################################################################################################
+        ###########################################################################################################
+        ###########################################################################################################
+
+        #In Satish's docs, the number of offsets are  same per table? That would be needed to have the data ordering in
+        # row#,table#,col#  instead of table#,row#,col#
         model = SplitTableBatchedEmbeddingBagsCodegen(
-        [(num_embedding_rows, embed_dim, EmbeddingLocation.DEVICE, ComputeDevice.CUDA)
-            for _ in range(num_tables)],weights_precision = SparseType.INT8).cuda()
-        
-        all_indices = torch.stack(indices, dim=0)
-        indices = all_indices.long().contiguous().view(-1).cuda()
-        all_lengths = torch.stack(lengths, dim=0).flatten()
-        offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).long().cuda()
+            [
+                (
+                    num_embedding_rows,
+                    embed_dim - 8,
+                    EmbeddingLocation.MANAGED_CACHING,
+                    ComputeDevice.CUDA,
+                )
+                for _ in range(num_tables)
+            ],
+            weights_precision = SparseType.INT8,
+            #feature_table_map = list_of_embedding_tables_tensors
+        ).cuda()
+
+        #Code is a slight modification of split_table_batched_embeddings_ops.py, def init_embedding_weights_uniform
+        splits = model.split_embedding_weights()
+        for i, emb in enumerate(splits):
+            assert (
+                len(emb.shape) == 2
+            ), "Int8 embedding only supported for 2D weight tensors."            
+            shape = [emb.shape[0], emb.shape[1]]# - model.int8_emb_row_dim_offset]
+            tmp_emb = list_of_embedding_tables_tensors[i].cuda()
+
+            emb.data[:,:].copy_(tmp_emb)
+            #emb.data[:,:-(model.int8_emb_row_dim_offset)].copy_(tmp_emb)
+            #tmp_emb_i8 = torch.ops.fb.FloatToFused8BitRowwiseQuantized(tmp_emb)
+            #emb.data.copy_(tmp_emb_i8)
+
+
+        result = model.forward(
+            indices,
+            offsets,
+        )    
+        torch.cuda.synchronize()
+        #result is torch.Size([63, 408])
+        #r = [result[:, i::num_tables] for i in range (num_tables)]
+        r = [result[:, i:i+32] for i in range (num_tables)]
+        #print(r[1][0])
+        print(torch.cuda.memory_stats)
+        return r
+        #r = r.view( r.shape[0]*r.shape[1], r.shape[2])
+        #result = [r[i,:] for i in range(r.shape[0])]
+        #return result
+        #all_indices = torch.stack(indices, dim=0)
+        #indices = all_indices.long().contiguous().view(-1).cuda()
+        #all_lengths = torch.stack(lengths, dim=0).flatten()
+        #offsets=torch.tensor(([0] + np.cumsum(all_lengths).tolist())).long().cuda()
     else:
-
+        for i in range(2):
+            print("QUANTIZING else!")
         concatenated_embedding_tables = torch.zeros( num_tables * num_embedding_rows, embed_dim ).cuda()
-        prefix_sum_offsets = [0]
-        prefix_sum_indices = [0]
         for i in range(num_tables):
-            concatenated_embedding_tables[i*num_embedding_rows:(i+1)*num_embedding_rows,:] = torch.clone(list_of_embedding_tables_tensors[i])
-            offsets[i] += prefix_sum_indices[i]
-            indices[i] += i*num_embedding_rows
-            prefix_sum_offsets.append(prefix_sum_offsets[-1] + len(offsets[i]))
-            prefix_sum_indices.append(prefix_sum_indices[-1] + indices[i].shape[0])
-        offsets = offsets.flatten()
-        indices = torch.cat(indices, dim=0).cuda()
+            concatenated_embedding_tables[i*num_embedding_rows:(i+1)*num_embedding_rows,:] = list_of_embedding_tables_tensors[i].cuda()
         model = torch.nn.EmbeddingBag.from_pretrained(concatenated_embedding_tables, mode = 'sum').to(device)
-        #torch.cuda.synchronize()
+        result = model(indices, offsets)
+        #result is 192,128
+    result = [ result[prefix_sum_offsets[i]:prefix_sum_offsets[i+1], :] for i in range (num_tables) ]
 
-    output = model(indices, offsets)
-
-    result = [ output[prefix_sum_offsets[i]:prefix_sum_offsets[i+1], :] for i in range (num_tables) ]
+    #result = [result[i::num_tables, :] for i in range (num_tables)]
+    #result = [ result[(i+prefix_sum_offsets[i]):(i+prefix_sum_offsets[i+1]):num_tables, :] for i in range (num_tables) ]
 
     return result
 
@@ -416,6 +493,11 @@ class DLRM_Net(nn.Module):
                 #ln_emb = ln_emb[self.local_emb_slice]
 
             # create operators
+            #######################################################################################################################
+            #######################################################################################################################
+            #######################################################################################################################
+            #######################################################################################################################
+            #######################################################################################################################            
             if ndevices <= 1:
                 self.emb_l = self.create_emb(m_spa, ln_emb)  #self.emb_l stores list of nn.EmbeddingBag instantiations. There are ln_emb.size() instantiations. Each instantion's dimension is m_spa columns by ln_emb[i] rows.
 
@@ -457,14 +539,17 @@ class DLRM_Net(nn.Module):
 
         process_all_tables_as_a_single_tensor = True
         if process_all_tables_as_a_single_tensor:
-
+            if emb_l is None:
+                list_of_embedding_tables_tensors = self.emb_l_q
+            else:
+                list_of_embedding_tables_tensors =  [e.weight for e in emb_l]
             ly = infer_gpu(
                 model = self, 
                 device = next(self.parameters()).device, 
-                list_of_embedding_tables_tensors = [emb_l[i].weight for i in range(len(emb_l))],
-                num_embedding_rows = emb_l[0].weight.shape[0], 
-                embed_dim = emb_l[0].weight.shape[1], 
-                num_tables = len(emb_l), 
+                list_of_embedding_tables_tensors = list_of_embedding_tables_tensors,
+                num_embedding_rows = len(list_of_embedding_tables_tensors[0]),
+                embed_dim = len(list_of_embedding_tables_tensors[0][0]),
+                num_tables = len(list_of_embedding_tables_tensors),
                 indices = lS_i,  #list of 1d tensors
                 offsets = lS_o,  #2d tensor
                 lengths = [x.shape[0] for x in lS_i], 
@@ -515,7 +600,87 @@ class DLRM_Net(nn.Module):
 
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
     def quantize_embedding(self, bits):
-
+        """
+        emb = []
+        emb.append(torch.FloatTensor([[-0.27341,  0.03442, -0.03392, -0.25681,  0.30706,  0.43672,  0.43053,
+                -0.21731, -0.26392,  0.39838,  0.04191, -0.34124,  0.07877, -0.28752,
+                -0.33985, -0.18040, -0.27464, -0.14082,  0.10969, -0.20656,  0.11433,
+                -0.37716, -0.21056, -0.22694,  0.06149,  0.05674, -0.21970,  0.17155,
+                -0.15404, -0.39372, -0.00655, -0.17976],
+                [ 0.40799,  0.29757,  0.02161, -0.01177,  0.19130,  0.40685, -0.23482,
+                0.20121, -0.40148,  0.39782,  0.21343,  0.35857, -0.36398, -0.14493,
+                0.31090,  0.28369,  0.40169,  0.21992,  0.37128, -0.31763, -0.43709,
+                0.43012,  0.06213, -0.42251,  0.36262,  0.31405,  0.02354, -0.19753,
+                0.40378,  0.14292,  0.01299, -0.26330],
+                [ 0.07249, -0.24687,  0.15673,  0.24212, -0.37316, -0.26838,  0.36272,
+                0.27507, -0.40194,  0.03928,  0.10230,  0.31934,  0.32213,  0.11816,
+                -0.30828, -0.28766,  0.44641,  0.16771,  0.01645, -0.20237,  0.16037,
+                -0.16096, -0.21080,  0.02464, -0.05678,  0.42974,  0.39430, -0.29634,
+                0.22931, -0.40895,  0.41226, -0.36954],
+                [ 0.31674,  0.10682, -0.06666,  0.24304,  0.02657, -0.13466, -0.34582,
+                -0.13631, -0.21489, -0.00432, -0.30249, -0.04384, -0.01568,  0.38206,
+                -0.13085, -0.34548,  0.43824,  0.01145, -0.24154,  0.05578, -0.08942,
+                0.41371,  0.19624,  0.19385,  0.24424, -0.17983, -0.26516, -0.44357,
+                -0.21975,  0.07273,  0.38498, -0.24139],
+                [ 0.40975,  0.38627, -0.27367,  0.12989,  0.39100, -0.21326, -0.15886,
+                -0.35694,  0.16019, -0.42316,  0.18242, -0.43950, -0.44245,  0.28245,
+                -0.16483, -0.42265,  0.13488, -0.27938,  0.03102,  0.40754, -0.01194,
+                -0.36280,  0.11246, -0.24537,  0.22124, -0.28704,  0.07018,  0.40641,
+                -0.04692, -0.12810, -0.19699,  0.29025]]))
+        emb.append(torch.FloatTensor([[ 0.42850, -0.15664,  0.33396,  0.21020,  0.14055,  0.29015, -0.07323,
+                -0.02302,  0.39116, -0.19163, -0.15280, -0.19715,  0.40195, -0.42736,
+                -0.19377, -0.16732,  0.09551,  0.21136,  0.38371, -0.11261,  0.04176,
+                0.40669, -0.13749,  0.15615,  0.02639, -0.41473,  0.02114,  0.31859,
+                -0.02332, -0.23895, -0.41641,  0.42314],
+                [ 0.02243, -0.19169,  0.18357,  0.01954,  0.20777, -0.08639,  0.12559,
+                -0.35251, -0.07740, -0.14124,  0.40190,  0.22675, -0.14763,  0.30974,
+                0.27002, -0.38648,  0.02151,  0.15901, -0.32810,  0.05379,  0.22291,
+                -0.36109, -0.05040,  0.44711, -0.35668, -0.03231,  0.28806,  0.34521,
+                0.44404, -0.35927, -0.17417,  0.19439],
+                [ 0.29188, -0.33870,  0.33787,  0.22743,  0.00377, -0.32600, -0.08054,
+                -0.35348, -0.29372, -0.11703,  0.16246, -0.26498,  0.33385,  0.10457,
+                -0.03544, -0.38472, -0.20837, -0.41963,  0.34716, -0.22655, -0.18551,
+                0.34825, -0.38426,  0.06559,  0.12975,  0.36548,  0.37557,  0.42535,
+                -0.09962,  0.42649,  0.03438,  0.36743],
+                [-0.42871, -0.28256,  0.21452, -0.22649, -0.06022, -0.33893, -0.18209,
+                -0.24851,  0.04371,  0.12766,  0.05841, -0.09600,  0.15212, -0.15409,
+                0.41725, -0.21561, -0.32636, -0.07655, -0.36751,  0.13858,  0.08966,
+                -0.11541, -0.28887, -0.31499, -0.04713,  0.42586,  0.13693,  0.36753,
+                -0.08073, -0.29961, -0.36387, -0.05154],
+                [ 0.02506,  0.28888,  0.15628, -0.11286, -0.40579,  0.10700,  0.08654,
+                -0.24092,  0.26153,  0.04785,  0.42795,  0.05007,  0.14691, -0.13211,
+                -0.36267,  0.11879,  0.31046, -0.33505, -0.21442, -0.13820,  0.15759,
+                0.17402,  0.15727, -0.29780, -0.09069,  0.07474, -0.01198, -0.11333,
+                -0.39380, -0.32731,  0.36327, -0.03212]]))
+        emb.append(torch.FloatTensor([[ 0.01758, -0.09590,  0.32071, -0.43757, -0.00166,  0.17116, -0.42252,
+                0.04860, -0.25584, -0.19813, -0.19334, -0.31393,  0.28279,  0.20648,
+                -0.02019,  0.05096, -0.33818,  0.40305, -0.36846,  0.00699, -0.21815,
+                0.14217, -0.11431,  0.30278,  0.35357, -0.26305,  0.24241, -0.17799,
+                0.08360, -0.02432, -0.30774,  0.12134],
+                [-0.28493, -0.02226,  0.35828,  0.23104, -0.32100,  0.03855, -0.06948,
+                0.06764, -0.10200,  0.00879,  0.07726, -0.26149, -0.13608,  0.20249,
+                -0.18496, -0.43853, -0.16563,  0.26291,  0.22624, -0.14405, -0.25083,
+                0.13123,  0.01462,  0.12318,  0.08294,  0.04881,  0.36968,  0.10914,
+                -0.22338, -0.41087,  0.13521, -0.15243],
+                [ 0.03405,  0.00803, -0.04823,  0.25976, -0.08477, -0.25676, -0.30863,
+                0.36584, -0.28705, -0.36133,  0.29937,  0.34463,  0.06512, -0.24379,
+                0.10290,  0.30022,  0.41155,  0.09330, -0.26728,  0.44208,  0.32442,
+                0.32123, -0.07328, -0.33121, -0.32177, -0.40126,  0.08831, -0.42180,
+                -0.07408, -0.05753,  0.39945,  0.28790],
+                [-0.03429, -0.04978,  0.04406,  0.19969,  0.10809, -0.14287,  0.43690,
+                -0.21308, -0.43638, -0.25834,  0.26456,  0.15024,  0.37073,  0.23751,
+                0.44603,  0.42768, -0.30522, -0.44395,  0.26790,  0.11635, -0.23647,
+                -0.25693,  0.44107, -0.33589,  0.09012, -0.28107,  0.25106,  0.40811,
+                0.11480,  0.19355, -0.19726,  0.19189],
+                [ 0.05995, -0.18809,  0.16625, -0.08336, -0.39570,  0.33361, -0.36259,
+                -0.34752, -0.17453, -0.31968,  0.17745, -0.17284, -0.33616,  0.27911,
+                -0.10976,  0.03157,  0.16658,  0.07527,  0.07013, -0.18617, -0.08529,
+                -0.29439,  0.29183, -0.16394, -0.06173,  0.36814, -0.19531, -0.07184,
+                0.02368, -0.10256,  0.11800,  0.14188]]))
+        for i in range(3):
+            emb[i].data[:,:] = 1.0
+            self.emb_l[i].weight.data = emb[i].data
+        """
         n = len(self.emb_l)
         self.emb_l_q = [None] * n
         for k in range(n):
@@ -523,6 +688,14 @@ class DLRM_Net(nn.Module):
                 self.emb_l_q[k] = ops.quantized.embedding_bag_4bit_prepack(
                     self.emb_l[k].weight
                 )
+
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            
+
             elif bits == 8:
                 self.emb_l_q[k] = ops.quantized.embedding_bag_byte_prepack(
                     self.emb_l[k].weight
@@ -533,6 +706,12 @@ class DLRM_Net(nn.Module):
         self.quantize_emb = True
         self.quantize_bits = bits
     def interact_features(self, x, ly):
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+                  
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
@@ -584,7 +763,40 @@ class DLRM_Net(nn.Module):
         else:
             return self.parallel_forward(dense_x, lS_o, lS_i)
 
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
     def sequential_forward(self, dense_x, lS_o, lS_i):
+        #OFFSETS!!!!
+        if False:
+            lS_o_test = torch.LongTensor([[ 0,  4,  9, 14, 17, 22, 27, 31, 36, 40, 44, 49, 54, 58, 63, 68],
+            [ 0,  4,  9, 13, 18, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72],
+            [ 0,  5, 10, 15, 20, 25, 29, 33, 38, 43, 48, 53, 58, 63, 68, 73]]).cuda()
+            self.lS_o = torch.clone(lS_o_test)
+            lS_o = self.lS_o
+
+            indexes = []
+            indexes.append(torch.LongTensor([1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1,
+                    2, 3, 4, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3,
+                    4, 0, 1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3,
+                    4]).cuda())
+            indexes.append(torch.LongTensor([0, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1, 2, 3, 0, 1,
+                    2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0,
+                    1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4,
+                    0, 1, 2, 3, 4]).cuda())
+            indexes.append(torch.LongTensor([0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3,
+                    4, 1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4,
+                    0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3,
+                    4, 0, 1, 2, 3, 4]).cuda())        
+            for e in indexes:
+                for i in range(len(e)):
+                    e[i] = 4*i // len(e)
+            self.lS_i = indexes.copy()
+            lS_i = self.lS_i
+
         # process dense features (using bottom mlp), resulting in a row vector
         x = self.apply_mlp(dense_x, self.bot_l)
         # debug prints
@@ -1163,6 +1375,12 @@ if __name__ == "__main__":
     # WARNING: to obtain exactly the same initialization for
     # the weights we need to start from the same random seed.
     # np.random.seed(args.numpy_rand_seed)
+
+    #####################################################################################################################
+    #####################################################################################################################
+    #####################################################################################################################
+    #####################################################################################################################
+    #####################################################################################################################
     dlrm = DLRM_Net(
         m_spa,
         ln_emb,
@@ -1182,6 +1400,7 @@ if __name__ == "__main__":
         qr_threshold=args.qr_threshold,
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
+        #should DLRM contain a self.device variable?
     )
     # test prints
     if args.debug_mode:
@@ -1190,13 +1409,53 @@ if __name__ == "__main__":
             print(param.detach().cpu().numpy())
         # print(dlrm)
 
+
+    if args.inference_only:
+        # Currently only dynamic quantization with INT8 and FP16 weights are
+        # supported for MLPs and INT4 and INT8 weights for EmbeddingBag
+        # post-training quantization during the inference.
+        # By default we don't do the quantization: quantize_{mlp,emb}_with_bit == 32 (FP32)
+
+        #####################################################################################################################################
+        #####################################################################################################################################
+        #####################################################################################################################################
+        #####################################################################################################################################
+        #   QUANTIZING THE EMBEDDINGS!!        
+        assert args.quantize_mlp_with_bit in [
+            8,
+            16,
+            32,
+        ], "only support 8/16/32-bit but got {}".format(args.quantize_mlp_with_bit)
+        assert args.quantize_emb_with_bit in [
+            4,
+            8,
+            32,
+        ], "only support 4/8/32-bit but got {}".format(args.quantize_emb_with_bit)
+        if args.quantize_mlp_with_bit != 32:
+            if args.quantize_mlp_with_bit in [8]:
+                quantize_dtype = torch.qint8
+            else:
+                quantize_dtype = torch.float16
+            dlrm = torch.quantization.quantize_dynamic(
+                dlrm, {torch.nn.Linear}, quantize_dtype
+            )
+        if args.quantize_emb_with_bit != 32:
+            dlrm.quantize_embedding(args.quantize_emb_with_bit)
+            # print(dlrm)
+
+
     if use_gpu:
         # Custom Model-Data Parallel
         # the mlps are replicated and use data parallelism, while
         # the embeddings are distributed and use model parallelism
-        dlrm = dlrm.to(device)  # .cuda()
+        ##############################################################################################################################        
+        ##############################################################################################################################
+        ##############################################################################################################################
+        ##############################################################################################################################
+        ##############################################################################################################################
         if dlrm.ndevices > 1:
-            dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb) ###############################################################################################
+            dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb) ##############################################################################
+        dlrm = dlrm.to(device)  # .cuda()
             
     if ext_dist.my_size > 1:
         if use_gpu:
@@ -1349,32 +1608,7 @@ if __name__ == "__main__":
     startTime0 = startTime
     skipped = 0        
 
-    if args.inference_only:
-        # Currently only dynamic quantization with INT8 and FP16 weights are
-        # supported for MLPs and INT4 and INT8 weights for EmbeddingBag
-        # post-training quantization during the inference.
-        # By default we don't do the quantization: quantize_{mlp,emb}_with_bit == 32 (FP32)
-        assert args.quantize_mlp_with_bit in [
-            8,
-            16,
-            32,
-        ], "only support 8/16/32-bit but got {}".format(args.quantize_mlp_with_bit)
-        assert args.quantize_emb_with_bit in [
-            4,
-            8,
-            32,
-        ], "only support 4/8/32-bit but got {}".format(args.quantize_emb_with_bit)
-        if args.quantize_mlp_with_bit != 32:
-            if args.quantize_mlp_with_bit in [8]:
-                quantize_dtype = torch.qint8
-            else:
-                quantize_dtype = torch.float16
-            dlrm = torch.quantization.quantize_dynamic(
-                dlrm, {torch.nn.Linear}, quantize_dtype
-            )
-        if args.quantize_emb_with_bit != 32:
-            dlrm.quantize_embedding(args.quantize_emb_with_bit)
-            # print(dlrm)
+
 
 
     #####################################################################################################################################
@@ -1441,7 +1675,10 @@ if __name__ == "__main__":
                     print("Warning: Skiping the batch %d with size %d" % (j, X.size(0)))
                     continue                
 
-
+                #####################################################################################################################################
+                #####################################################################################################################################
+                #####################################################################################################################################
+                #####################################################################################################################################                
                 # forward pass
                 Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
 
@@ -1549,20 +1786,7 @@ if __name__ == "__main__":
                         # forward pass
                         Z_test = dlrm_wrap(
                             X_test, lS_o_test, lS_i_test, use_gpu, device
-                        )
-
-                        
-                        
-                        
-                        #########################################################################################################
-                        #########################################################################################################
-                        #########################################################################################################
-                        #########################################################################################################
-                        #########################################################################################################
-                        # CONVERT GPU-OPTIMIZED FORMAT BACK TO REGULAR FORMAT HERE ##############################################
-
-
-
+                        )                                                        
 
                         if args.mlperf_logging:
                             S_test = Z_test.detach().cpu().numpy()  # numpy array
